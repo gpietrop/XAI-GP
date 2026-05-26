@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.env
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/
+data/raw/
+results/
+*.pkl
+*.h5
+CLAUDE.md
