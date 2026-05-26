@@ -241,6 +241,26 @@ def _singularities_in_range(f: sympy.Basic, var: sympy.Symbol, lo: float, hi: fl
     return [] if denom == 1 else _real_roots_in_range(denom, var, lo, hi)
 
 
+# All real poles of f regardless of range — mathematical singularities
+def _singularities_global(f: sympy.Basic, var: sympy.Symbol) -> list[float]:
+    _, denom = sympy.fraction(sympy.together(f))
+    if denom == 1:
+        return []
+    try:
+        sols = sympy.solve(denom, var)
+        pts = []
+        for s in sols:
+            try:
+                ev = s.evalf()
+                if abs(float(sympy.im(ev))) < 1e-10:
+                    pts.append(round(float(sympy.re(ev)), 6))
+            except (TypeError, ValueError):
+                pass
+        return sorted(set(pts))
+    except Exception:
+        return []
+
+
 # Per-variable critical points, inflection points, singularities, and monotonicity
 def behavioral_regimes(expr: sympy.Basic, var_ranges: dict) -> dict:
     active = sorted([v for v in var_ranges if v in expr.free_symbols], key=str)
@@ -292,3 +312,345 @@ def simplify_expression(expr_str: str, var_map: dict | None = None) -> dict:
         "continuous_vars": sorted(continuous_vars),
         "dual_role_vars": sorted(boolean_vars & continuous_vars),
     }
+
+
+# ------------------------------------------------------------------
+# HELPER — normalise string/Symbol keys in var_ranges to Symbol objects
+# ------------------------------------------------------------------
+
+def _normalize_var_ranges(var_ranges: dict, expr: sympy.Basic) -> dict:
+    free = {str(s): s for s in expr.free_symbols}
+    result: dict = {}
+    for k, v in var_ranges.items():
+        sym = free.get(str(k), k) if isinstance(k, str) else k
+        result[sym] = v
+    return result
+
+
+# ------------------------------------------------------------------
+# parse_expression
+# ------------------------------------------------------------------
+
+# Unified entry-point: parse, simplify, detect mixed structure
+def parse_expression(expr_str: str, var_map: dict | None = None) -> dict:
+    simp = simplify_expression(expr_str, var_map)
+    expr = simp["expr"]
+    branches = _extract_branches(expr, var_map) if isinstance(expr, Piecewise) else None
+    return {
+        "original": expr_str,
+        "simplified": simp["simplified"],
+        "simplified_named": simp["simplified_named"],
+        "expr": expr,
+        "variables": sorted(str(v) for v in expr.free_symbols),
+        "constants": _extract_numeric_constants(expr),
+        "node_count_before": simp["nodes_before"],
+        "node_count_after": simp["nodes_after"],
+        "is_mixed": simp["is_mixed"],
+        "boolean_vars": simp["boolean_vars"],
+        "continuous_vars": simp["continuous_vars"],
+        "dual_role_vars": simp["dual_role_vars"],
+        "branches": branches,
+    }
+
+
+# ------------------------------------------------------------------
+# classify_symbols
+# ------------------------------------------------------------------
+
+# Classify every free symbol by structural role (continuous / boolean / mixed)
+def classify_symbols(expr: sympy.Basic, variable_names: dict | None = None) -> dict:
+    boolean_vars, continuous_vars = _detect_roles(expr)
+    result: dict = {}
+    for sym in sorted(expr.free_symbols, key=str):
+        name = str(sym)
+        in_bool = name in boolean_vars
+        in_cont = name in continuous_vars
+        role = "mixed" if (in_bool and in_cont) else ("boolean" if in_bool else "continuous")
+        occurrences = sum(1 for n in postorder_traversal(expr) if n == sym)
+        result[name] = {
+            "symbol": name,
+            "display_name": (variable_names or {}).get(name),
+            "role": role,
+            "in_arithmetic": in_cont,
+            "in_relational": in_bool,
+            "occurrences": occurrences,
+        }
+    return result
+
+
+# ------------------------------------------------------------------
+# find_constant_recurrences
+# ------------------------------------------------------------------
+
+# Count numeric constants; flag values that recur in non-trivial positions
+def find_constant_recurrences(expr: sympy.Basic) -> dict:
+    counts: dict[float, int] = {}
+    for node in postorder_traversal(expr):
+        if isinstance(node, sympy.Number):
+            v = float(node)
+            counts[v] = counts.get(v, 0) + 1
+
+    def _trivial(v: float) -> bool:
+        return abs(v) < 1e-12 or abs(abs(v) - 1.0) < 1e-12
+
+    constants = sorted(
+        [
+            {
+                "value": v,
+                "count": c,
+                "is_trivial": _trivial(v),
+                "simplification_candidate": c > 1 and not _trivial(v),
+            }
+            for v, c in counts.items()
+        ],
+        key=lambda d: (-d["count"], -abs(d["value"])),
+    )
+    recurrent = [d for d in constants if d["simplification_candidate"]]
+    return {"constants": constants, "recurrent": recurrent, "has_recurrences": bool(recurrent)}
+
+
+# ------------------------------------------------------------------
+# analyze_regimes
+# ------------------------------------------------------------------
+
+# Extend behavioral_regimes with derivative expressions and a short interpretation string
+def analyze_regimes(expr: sympy.Basic, var_ranges: dict) -> dict:
+    var_ranges = _normalize_var_ranges(var_ranges, expr)
+    base = behavioral_regimes(expr, var_ranges)
+    active = sorted([v for v in var_ranges if v in expr.free_symbols], key=str)
+    mids = {v: (var_ranges[v][0] + var_ranges[v][1]) / 2 for v in active}
+
+    variables: dict = {}
+    for var in active:
+        info = base["variables"][var]
+        fixed = expr.subs({v: mids[v] for v in active if v != var})
+        df = sympy.diff(fixed, var)
+        d2f = sympy.diff(df, var)
+        sings = info["singularities"]
+        crits = info["critical_points"]
+        if info["monotonic"]:
+            interp = "monotonic over the inspected range"
+        elif sings:
+            pts = ", ".join(str(p) for p in sings)
+            interp = (
+                f"has singularit{'ies' if len(sings) > 1 else 'y'} at {pts}"
+                " — output unbounded near those points"
+            )
+        elif crits:
+            pts = ", ".join(str(p) for p in crits)
+            interp = f"has possible regime changes at {pts}"
+        else:
+            interp = "non-monotonic over the inspected range"
+        sing_global = _singularities_global(fixed, var)
+        variables[str(var)] = {
+            **info,
+            # keep "singularities" for backward compatibility — same as inside_range
+            "singularities_inside_range": info["singularities"],
+            "singularities_global": sing_global,
+            "derivative": str(df),
+            "second_derivative": str(d2f),
+            "interpretation": interp,
+        }
+    return {"variables": variables}
+
+
+# ------------------------------------------------------------------
+# sensitivity_analysis
+# ------------------------------------------------------------------
+
+# Partial-effect ranking; flags non-finite sweep values as warnings
+def sensitivity_analysis(expr: sympy.Basic, var_ranges: dict) -> dict:
+    var_ranges = _normalize_var_ranges(var_ranges, expr)
+    contrib = variable_contributions(expr, var_ranges)
+    warnings_list: list[str] = []
+
+    for var, (_, y_vals) in contrib["partial_effects"].items():
+        if not np.all(np.isfinite(y_vals)):
+            warnings_list.append(f"Non-finite values in partial effect sweep of {str(var)}")
+
+    return {
+        "variable_ranking": [(str(v), r) for v, r in contrib["rankings"]],
+        "partial_effects": {str(k): v for k, v in contrib["partial_effects"].items()},
+        "warnings": warnings_list,
+    }
+
+
+# ------------------------------------------------------------------
+# Internal: assemble only verified facts suitable for LLM input
+# ------------------------------------------------------------------
+
+_MONOTONICITY_METHOD = (
+    "Fix all other variables at their data-range midpoint; "
+    "verify that the first derivative has no real zeros and the expression has no poles "
+    "within the inspected range."
+)
+_CRITICAL_POINT_METHOD = (
+    "Fix all other variables at their data-range midpoint; "
+    "solve the first derivative equal to zero analytically within the inspected range."
+)
+
+def _build_facts_for_llm(
+    parsed: dict,
+    symbols_info: dict,
+    constants_report: dict,
+    sensitivity: dict | None,
+    regimes: dict | None,
+    var_ranges: dict | None = None,
+) -> dict:
+    facts: dict = {
+        "expression": {
+            "original": parsed["original"],
+            "simplified": parsed["simplified"],
+            "simplified_named": parsed["simplified_named"],
+            "node_count_after_simplification": parsed["node_count_after"],
+            "is_mixed_boolean_continuous": parsed["is_mixed"],
+        },
+        "variables": {
+            name: {
+                "display_name": info["display_name"],
+                "role": info["role"],
+                "occurrences": info["occurrences"],
+            }
+            for name, info in symbols_info.items()
+        },
+        "constants": {
+            "non_trivial_values": [
+                c["value"] for c in constants_report["constants"] if not c["is_trivial"]
+            ],
+            "recurrent_values": [c["value"] for c in constants_report["recurrent"]],
+        },
+        "variable_ranking": [],
+        "variable_ranking_method": "output_range_sensitivity",
+        "input_ranges": {
+            str(k): list(v) for k, v in (var_ranges or {}).items()
+        },
+        "regimes": {},
+        "monotonicity_method": _MONOTONICITY_METHOD,
+        "critical_point_method": _CRITICAL_POINT_METHOD,
+        "warnings": [],
+    }
+    if parsed["dual_role_vars"]:
+        facts["warnings"].append(
+            "Dual-role variables (appear in both boolean and arithmetic contexts): "
+            + str(parsed["dual_role_vars"])
+        )
+    if sensitivity and "error" not in sensitivity:
+        facts["variable_ranking"] = [
+            {"variable": v, "output_range": r}
+            for v, r in sensitivity["variable_ranking"]
+            if np.isfinite(float(r))
+        ]
+        facts["warnings"].extend(sensitivity["warnings"])
+    if regimes and "error" not in regimes:
+        facts["regimes"] = {
+            v: {
+                "interpretation": info["interpretation"],
+                "singularities_inside_range": info.get("singularities_inside_range", info.get("singularities", [])),
+                "singularities_global": info.get("singularities_global", []),
+                "critical_points": info["critical_points"],
+                "monotonic": info["monotonic"],
+            }
+            for v, info in regimes["variables"].items()
+        }
+    return facts
+
+
+# ------------------------------------------------------------------
+# generate_report
+# ------------------------------------------------------------------
+
+# Main user-facing function: runs the full deterministic analysis pipeline
+def generate_report(
+    expr_str: str,
+    var_ranges: dict | None = None,
+    var_map: dict | None = None,
+) -> dict:
+    parsed = parse_expression(expr_str, var_map)
+    expr = parsed["expr"]
+    symbols_info = classify_symbols(expr, var_map)
+    constants_report = find_constant_recurrences(expr)
+    top_warnings: list[str] = []
+
+    if parsed["dual_role_vars"]:
+        top_warnings.append(f"Dual-role variables detected: {parsed['dual_role_vars']}")
+
+    complexity = sensitivity = regimes = None
+    if var_ranges is not None:
+        sym_ranges = _normalize_var_ranges(var_ranges, expr)
+        try:
+            complexity = complexity_report(expr, sym_ranges)
+        except Exception as exc:
+            complexity = {"error": str(exc)}
+            top_warnings.append(f"complexity_report failed: {exc}")
+        try:
+            sensitivity = sensitivity_analysis(expr, sym_ranges)
+            top_warnings.extend(sensitivity.get("warnings", []))
+        except Exception as exc:
+            sensitivity = {"error": str(exc)}
+            top_warnings.append(f"sensitivity_analysis failed: {exc}")
+        try:
+            regimes = analyze_regimes(expr, sym_ranges)
+        except Exception as exc:
+            regimes = {"error": str(exc)}
+            top_warnings.append(f"analyze_regimes failed: {exc}")
+
+    return {
+        "parsed": parsed,
+        "symbol_classification": symbols_info,
+        "constants": constants_report,
+        "complexity": complexity,
+        "sensitivity": sensitivity,
+        "regimes": regimes,
+        "warnings": top_warnings,
+        "facts_for_llm": _build_facts_for_llm(
+            parsed, symbols_info, constants_report, sensitivity, regimes, var_ranges
+        ),
+    }
+
+
+# ------------------------------------------------------------------
+# generate_plain_language_prompt
+# ------------------------------------------------------------------
+
+# Build a safe prompt for a downstream LLM; encodes only verified facts
+def generate_plain_language_prompt(report: dict) -> str:
+    import json
+
+    facts_json = json.dumps(report["facts_for_llm"], indent=2, default=str)
+    return "\n".join(
+        [
+            "You are a scientific writing assistant helping a researcher understand a symbolic "
+            "regression expression produced by genetic programming.",
+            "",
+            "STRICT RULES:",
+            "1. Explain only the facts listed in VERIFIED FACTS below. Do not add information absent from it.",
+            "2. Do not infer causality or domain meaning from variable names.",
+            "3. Do not mention any variable not present in the 'variables' section.",
+            "4. When describing behavior (monotone, bounded, singular), state explicitly that it holds "
+            "only over the inspected input ranges.",
+            "5. If something is approximate or uncertain, say so explicitly.",
+            "6. Avoid phrases like 'this suggests', 'this implies', or 'therefore' unless directly "
+            "traceable to a fact in VERIFIED FACTS.",
+            "7. Variable ranking is an output-range sensitivity estimate over the inspected input ranges. "
+            "Do not call it causal importance, global importance, or relevance unless those words appear "
+            "explicitly in VERIFIED FACTS.",
+            "8. When describing monotonicity, regime changes, or critical points, state that these are "
+            "reported by the deterministic analysis under the method given in 'monotonicity_method' and "
+            "'critical_point_method'. If those fields are absent, say the method is unspecified.",
+            "9. When discussing singularities, distinguish between singularities inside the inspected "
+            "input ranges ('singularities_inside_range') and mathematical singularities outside those "
+            "ranges ('singularities_global' minus 'singularities_inside_range'). If only one list is "
+            "provided, state which one it is.",
+            "",
+            f"VERIFIED FACTS:\n{facts_json}",
+            "",
+            "TASK:",
+            "Write a plain-language explanation of this symbolic regression expression for a non-expert reader.",
+            "Cover:",
+            "  (1) What the expression computes in structural terms.",
+            "  (2) Which variables have the largest output-range sensitivity (use that phrase, not 'importance').",
+            "  (3) Any numerical risks: singularities inside the inspected ranges, non-finite outputs.",
+            "Do not invent domain knowledge. If a variable's scientific meaning is not given, "
+            "refer to it by name only.",
+        ]
+    )
