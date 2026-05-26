@@ -619,8 +619,7 @@ def generate_plain_language_prompt(report: dict) -> str:
     facts_json = json.dumps(report["facts_for_llm"], indent=2, default=str)
     return "\n".join(
         [
-            "You are a scientific writing assistant helping a researcher understand a symbolic "
-            "regression expression produced by genetic programming.",
+            "You are a scientific writing assistant helping a researcher understand a symbolic regression expression produced by genetic programming.",
             "",
             "STRICT RULES:",
             "1. Explain only the facts listed in VERIFIED FACTS below. Do not add information absent from it.",
@@ -637,10 +636,6 @@ def generate_plain_language_prompt(report: dict) -> str:
             "8. When describing monotonicity, regime changes, or critical points, state that these are "
             "reported by the deterministic analysis under the method given in 'monotonicity_method' and "
             "'critical_point_method'. If those fields are absent, say the method is unspecified.",
-            "9. When discussing singularities, distinguish between singularities inside the inspected "
-            "input ranges ('singularities_inside_range') and mathematical singularities outside those "
-            "ranges ('singularities_global' minus 'singularities_inside_range'). If only one list is "
-            "provided, state which one it is.",
             "",
             f"VERIFIED FACTS:\n{facts_json}",
             "",
